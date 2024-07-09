@@ -1,1 +1,1 @@
-# cable_temperature_prediction
+Temperature prediction of medium voltage cable joint using RNN, LSTM and GRU models.
