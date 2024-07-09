@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 
-# custom RNN model
 class RecurrentNeuralNetwork(nn.Module):
   def __init__(self, input_size, hidden_size, num_layers, output_size):
     super(RecurrentNeuralNetwork, self).__init__()
@@ -59,7 +58,6 @@ class GatedRecurrentUnitNetwork(nn.Module):
 
     self.gru = nn.GRU(self.input_size, self.hidden_size, self.num_layers, batch_first=True)
     self.fc = nn.Linear(in_features=self.hidden_size, out_features=self.output_size)
-
 
   def forward(self, x):
     batch_size = x.shape[0]

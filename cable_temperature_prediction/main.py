@@ -1,9 +1,9 @@
 import os
 import torch
 from pathlib import Path
+from config import params
 from engine import train, predict
 from torch.utils.data import DataLoader
-from config import params
 from viz import plot_loss, plot_predictions, plot_error
 from data import read_data, moving_window_normalization, CableSeriesData, Augmentations
 from models import RecurrentNeuralNetwork, LongShortTermMemoryNetwork, GatedRecurrentUnitNetwork
@@ -44,7 +44,7 @@ if __name__ == "__main__":
   else:
     raise NotImplementedError
 
-
+  # isolate thermocouple of cable joint
   train_df = train_df['Thermocouple 5']
   test_df = test_df['Thermocouple 5']
 
@@ -69,9 +69,9 @@ if __name__ == "__main__":
 
   y_pred, y_true = predict(model, test_loader, device=device)
 
-  plot_loss(results, OUTPUT_FOLDER_PATH)
-  plot_predictions(y_pred, y_true, OUTPUT_FOLDER_PATH)
-  plot_error(y_pred, y_true, OUTPUT_FOLDER_PATH)    
+  plot_loss(results, MODEL_TYPE, OUTPUT_FOLDER_PATH)
+  plot_predictions(y_pred, y_true, MODEL_TYPE, OUTPUT_FOLDER_PATH)
+  plot_error(y_pred, y_true, MODEL_TYPE, OUTPUT_FOLDER_PATH)    
 
 
 
