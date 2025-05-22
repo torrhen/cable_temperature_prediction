@@ -1,80 +1,106 @@
-import os
 import torch
-from pathlib import Path
+import config
+import pandas as pd
 from config import params
+from models import get_model
+from data import CableDataset
 from engine import train, predict
+from transforms import Transforms
 from torch.utils.data import DataLoader
 from viz import plot_loss, plot_predictions, plot_error
-from data import read_data, moving_window_normalization, CableSeriesData, Augmentations
-from models import RecurrentNeuralNetwork, LongShortTermMemoryNetwork, GatedRecurrentUnitNetwork
 
 
 if __name__ == "__main__":
 
   device = "cuda" if torch.cuda.is_available() else "cpu"
-  print(device)
+  print(f"Running on {device}")
 
-  SAMPLES_PER_HOUR = 12
-  HOURS_IN_DAY = 24
+  df = pd.read_csv(config.PROJECT_DATA_FILE_PATH, index_col=0, parse_dates=[0], dayfirst=True)
+  df = df.resample("5min").mean()
+  # replace nan values with forward fill of last observation
+  df = df.interpolate()
+  df = df.round(4)
 
-  # MODEL_TYPE = 'RNN'
-  # MODEL_TYPE = 'LSTM'
-  MODEL_TYPE = 'GRU'
+  # 80:10:10 split
+  train_df = df.iloc[:int(df.shape[0] * 0.8)]
+  validation_df = df.iloc[int(df.shape[0] * 0.8):int(df.shape[0] * 0.9)]
+  test_df = df.iloc[int(df.shape[0] * 0.9):]
 
-  DATA_FILE_PATH = Path(os.getcwd()) / Path("data/cable.csv")
-  df = read_data(DATA_FILE_PATH)
-  df = moving_window_normalization(df, window_size=SAMPLES_PER_HOUR * HOURS_IN_DAY)
+  if not config.PROJECT_TRAIN_DATA_FILE_PATH.exists():
+    train_df.to_csv(config.PROJECT_TRAIN_DATA_FILE_PATH)
+  if not config.PROJECT_VALIDATION_DATA_FILE_PATH.exists():
+    validation_df.to_csv(config.PROJECT_VALIDATION_DATA_FILE_PATH)
+  if not config.PROJECT_TEST_DATA_FILE_PATH.exists():
+    test_df.to_csv(config.PROJECT_TEST_DATA_FILE_PATH)
 
-  train_df = df.iloc[:-(SAMPLES_PER_HOUR * HOURS_IN_DAY * 3)].round(4)
-  test_df = df.iloc[-(SAMPLES_PER_HOUR * HOURS_IN_DAY * 3):].round(4)
+  model_params, train_params = params[config.MODEL_TYPE].values()
 
-  OUTPUT_FOLDER_PATH = Path(os.getcwd()) / Path(f"output/{MODEL_TYPE.lower()}")
-  OUTPUT_FOLDER_PATH.mkdir(parents=True, exist_ok=True)
+  # select model architecture
+  model = get_model(config.MODEL_TYPE, model_params, device)
 
-  data_params, model_params, train_params = params[MODEL_TYPE].values()
+  # create train dataset
+  train_data = CableDataset(
+    config.PROJECT_TRAIN_DATA_FILE_PATH,
+    model_params['window_size'],
+    transforms=Transforms(),
+  )
+  train_loader = DataLoader(dataset=train_data, batch_size=train_params['batch_size'], shuffle=True, drop_last=False)
 
-  if MODEL_TYPE == "RNN":
-    model = RecurrentNeuralNetwork(input_size=1, hidden_size=model_params['hidden_size'], num_layers=model_params['num_layers'], output_size=data_params['output_length']).to(device)
+  train_data_mean, train_data_std, train_diffs_mean, train_diffs_std, train_stats_mean, train_stats_std = train_data.fit_normalisation()
 
-  elif MODEL_TYPE == "LSTM":
-    model = LongShortTermMemoryNetwork(input_size=1, hidden_size=model_params['hidden_size'], num_layers=model_params['num_layers'], output_size=1).to(device)
+  # create validation dataset and normalise with train statistics
+  validation_data = CableDataset(
+    config.PROJECT_VALIDATION_DATA_FILE_PATH,
+    model_params['window_size'],
+    transforms=None,
+    normalise=(train_data_mean, train_data_std, train_diffs_mean, train_diffs_std, train_stats_mean, train_stats_std)
+  )
+  validation_loader = DataLoader(dataset=validation_data, batch_size=train_params['batch_size'], shuffle=True, drop_last=False)
 
-  elif MODEL_TYPE == "GRU":
-    model = GatedRecurrentUnitNetwork(input_size=1, hidden_size=model_params['hidden_size'], num_layers=model_params['num_layers'], output_size=1).to(device)
-  else:
-    raise NotImplementedError
-
-  # isolate thermocouple of cable joint
-  train_df = train_df['Thermocouple 5']
-  test_df = test_df['Thermocouple 5']
-
-  train_data = CableSeriesData(train_df, data_params['input_length'], data_params['output_length'], transforms=Augmentations())
-  test_data = CableSeriesData(test_df, data_params['input_length'], data_params['output_length'], transforms=None)
-  
-  train_loader = DataLoader(dataset=train_data, batch_size=train_params['batch_size'], shuffle=False, drop_last=False)
+  # create test dataset and normalise with train statistics
+  test_data = CableDataset(
+    config.PROJECT_TEST_DATA_FILE_PATH,
+    model_params['window_size'],
+    transforms=None,
+    normalise=(train_data_mean, train_data_std, train_diffs_mean, train_diffs_std, train_stats_mean, train_stats_std)
+  )
   test_loader = DataLoader(dataset=test_data, batch_size=1, shuffle=False, drop_last=False)
 
   loss_fn = torch.nn.MSELoss()
-  optimizer = torch.optim.Adam(params=model.parameters(), lr=train_params['lr'])
+  optimizer = torch.optim.Adam(params=model.parameters(), lr=train_params['lr'], weight_decay=train_params['weight_decay'])
 
   results = train(
     model=model,
     train_dataloader=train_loader,
-    val_dataloader=test_loader,
+    val_dataloader=validation_loader,
     optimizer=optimizer,
     loss_fn=loss_fn,
     device=device,
     epochs=train_params['epochs']
   )
 
-  y_pred, y_true = predict(model, test_loader, device=device)
+  best_epoch = results['val_loss'].index(min(results['val_loss'])) # best epoch based on validation loss
+  best_train_loss = results['train_loss'][best_epoch]
+  best_validation_loss = results['val_loss'][best_epoch]
 
-  plot_loss(results, MODEL_TYPE, OUTPUT_FOLDER_PATH)
-  plot_predictions(y_pred, y_true, MODEL_TYPE, OUTPUT_FOLDER_PATH)
-  plot_error(y_pred, y_true, MODEL_TYPE, OUTPUT_FOLDER_PATH)    
+  print(f"\nBest Epoch: {best_epoch + 1}")
+  print("----------")
+  print(f"| Best Train Loss: {results['train_loss'][best_epoch]:.4f} |\n")
+  print(f"| Best Validation Loss: {results['val_loss'][best_epoch]:.4f} |\n")
 
+  # plot train and validation loss curves
+  plot_loss(results, config.MODEL_TYPE, config.MODEL_OUTPUT_DIR)
 
+  # load best model using model state
+  best_model = get_model(config.MODEL_TYPE, model_params, device)
+  best_model.load_state_dict(results['model_state'][best_epoch])
 
+  # plot predictions and error for test data using best model
+  y_pred, y_true = predict(best_model, test_loader, device=device)
 
-  
+  # concatenate predictions to test data frame
+  test_df['Thermocouple 5 Predictions'] = test_df['Thermocouple 5']
+  test_df['Thermocouple 5 Predictions'].iloc[model_params['window_size']:] = y_pred.numpy(force=True) # take the ground truth before predictions
 
+  plot_predictions(test_df, config.MODEL_TYPE, config.MODEL_OUTPUT_DIR)
+  plot_error(test_df, config.MODEL_TYPE, config.MODEL_OUTPUT_DIR)

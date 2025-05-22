@@ -1,79 +1,102 @@
 import torch
-import torchvision
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 
-def read_data(filepath: str):
-  df = pd.read_csv(filepath, index_col=0, parse_dates=[0], dayfirst=True)
-  df = df.resample("5min").mean()
-  # replace nan values with forward fill of last observation
-  df = df.interpolate().round(2)
-  return df
 
-def moving_window_normalization(df: pd.DataFrame, window_size: int):
-  _df = df.iloc[window_size:, :].copy()
-  for i in range(window_size, df.shape[0]):
-    _df.iloc[i - window_size, :] = (((df.iloc[i - window_size : i] - df.iloc[i - window_size : i].mean(axis=0)) / (df.iloc[i - window_size : i].std(axis=0) + 1e-5)).iloc[-1, :])
-  return _df
-
-class GaussianNoise(torch.nn.Module):
+class CableDataset(Dataset):
   '''
-  Perturb sequence data with some amount of gaussian noise.
+  Medium voltage cable time series dataset. Derived from pytorch base class.
   '''
-  def __init__(self, var=0.1):
+  def __init__(self, df, window_size, transforms=None, normalise=None):
     super().__init__()
-    self.var = var
-
-  def forward(self, x):
-    return x + (self.var**0.5) * torch.randn(x.shape)
-
-class SequenceMask(torch.nn.Module):
-  '''
-  Randomly mask out data within each sequence.
-  '''
-  def __init__(self, p=0.2):
-    super().__init__()
-    self.p = p
-    self.dropout = torch.nn.Dropout1d(p=self.p)
-
-  def forward(self, x):
-    with torch.inference_mode():
-      return self.dropout(x)
-
-class Augmentations(torch.nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.transforms = torch.nn.Sequential(
-      torchvision.transforms.RandomApply([GaussianNoise()], p=0.5),
-      torchvision.transforms.RandomApply([SequenceMask()], p=0.5)
-    )
-  
-  def forward(self, x):
-    return self.transforms(x)
-
-class CableSeriesData(Dataset):
-  def __init__(self, df, input_length, output_length, transforms=None):
-    super().__init__()
-    self.df = df
-    self.input_length = input_length
-    self.output_length = output_length
+    self.df = pd.read_csv(df)
+    self.input_features = [
+      'Thermocouple 1',
+      'Thermocouple 2',
+      'Thermocouple 3',
+      'Thermocouple 4',
+      'Thermocouple 6',
+      'Thermocouple 7',
+      'Phase (Blue)',
+      'Phase (Yellow)',
+      'Phase (Red)'
+    ]
+    self.target_feature = 'Thermocouple 5'
+    self.window_size = window_size
     self.transforms = transforms
-    self.X, self.y = self.make_dataset()
+    self.normalise = normalise
+    self.X_data, self.X_diff, self.X_stats, self.y = self.make_dataset()
 
+    # calulate the normalisation statistics from train data
+    if not self.normalise:
+      self.X_data_mean, self.X_data_std, self.X_diff_mean, self.X_diff_std, self.X_stats_mean, self.X_stats_std = self.fit_normalisation()
+    else:
+      self.X_data_mean, self.X_data_std, self.X_diff_mean, self.X_diff_std, self.X_stats_mean, self.X_stats_std = self.normalise
+    
   def make_dataset(self):
-    inputs, targets = [], []
-    for i in range(self.df.shape[0] - (self.input_length + self.output_length)):
-      inputs.append(self.df[i : i + self.input_length].values)
-      targets.append(self.df[i + self.input_length : i + (self.input_length + self.output_length)].values)
-    return np.stack(inputs), np.stack(targets)
+    inputs, differences, statistics, targets = [], [], [], []
+    for i in range(self.window_size, self.df.shape[0]):
+      x = self.df.iloc[i - self.window_size : i][self.input_features].to_numpy()
+      d = self.calculate_differences(x)
+      s = self.calculate_statistics(x)
+      y = self.df.iloc[i][self.target_feature]
+      inputs.append(x)
+      differences.append(d)
+      statistics.append(s)
+      targets.append(y)
+    return np.stack(inputs), np.stack(differences), np.stack(statistics), np.asarray(targets)
+  
+  def calculate_statistics(self, x):
+    '''
+    Calculate the summary statistics for each sample window.
+    '''
+    s = []
+    s.append(np.amin(x, axis=0))
+    s.append(np.amax(x, axis=0))
+    s.append(np.median(x, axis=0))
+    s.append(np.mean(x, axis=0))
+    s.append(np.var(x, axis=0))
+    return np.concatenate(s)
+  
+  def calculate_differences(self, x):
+    '''
+    Calculate the first differences between consecutive time interval samples within each window.
+    '''
+    d = np.diff(x, axis=0)
+    return np.vstack([np.zeros_like(d[0]), d])
 
+  def fit_normalisation(self):
+    # return the mean and standard deviation for window samples and summary staticstics over whople dataset separately
+    return np.mean(self.X_data, axis=(0, 1)), np.std(self.X_data, axis=(0, 1)), np.mean(self.X_diff, axis=(0, 1)), np.std(self.X_diff, axis=(0, 1)), np.mean(self.X_stats, axis=0), np.std(self.X_stats, axis=0)
+  
   def __len__(self):
-    return self.X.shape[0]
+    return self.X_data.shape[0]
 
   def __getitem__(self, idx):
-    x, y = torch.as_tensor(self.X[idx], dtype=torch.float32).unsqueeze(dim=-1), torch.as_tensor(self.y[idx], dtype=torch.float32)
+    x_tensor = torch.as_tensor(self.X_data[idx], dtype=torch.float32)
+    y_tensor = torch.as_tensor(self.y[idx], dtype=torch.float32).unsqueeze(dim=-1)
+
+    # augment new samples
     if self.transforms:
-      x = self.transforms(x)
-    return x, y
+      x_tensor, y_tensor = self.transforms((x_tensor, y_tensor))
+
+    # calculate new summary stats on window
+    s_tensor = torch.as_tensor(self.calculate_statistics(x_tensor.numpy(force=True)), dtype=torch.float32)
+    # calculate differences of samples within window
+    d_tensor = torch.as_tensor(self.calculate_differences(x_tensor.numpy(force=True)), dtype=torch.float32)
+
+    # normalise data and summary statistics based on training data
+    x_tensor = (x_tensor - self.X_data_mean) / (self.X_data_std + 1e-8)
+    d_tensor = (d_tensor - self.X_diff_mean) / (self.X_diff_std + 1e-8)
+    s_tensor = (s_tensor - self.X_stats_mean) / (self.X_stats_std + 1e-8)
+
+    # clip values to +/- 3 stdd
+    x_tensor = torch.clip(x_tensor, min=-3.0, max=3.0)
+    d_tensor = torch.clip(d_tensor, min=-3.0, max=3.0)
+    s_tensor = torch.clip(s_tensor, min=-3.0, max=3.0)
+
+    x_tensor = torch.concatenate([x_tensor, d_tensor], axis=1)
+
+    return x_tensor, s_tensor, y_tensor
   
