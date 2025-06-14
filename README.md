@@ -1,4 +1,4 @@
-Cable joint temperature prediction using recurrent neural network (RNN), long short term memory (LSTM) and Gated Recurrent Unit (GRU) models.
+Cable joint temperature prediction using recurrent neural network (RNN), long short term memory (LSTM), Gated Recurrent Unit (GRU) and Transformer models.
 
 The following input variables are used to train each model to predict the target variable "Thermocouple 5":
 - Thermocouple 1
@@ -28,3 +28,12 @@ The following steps are used to clean, preprocess, train and evaulate the model:
 9. After augmentation, the differences between samples within each window as well as the summary statistics are recalculated to capture any changes. 
 10. Each sample window, its differences and summary statistics, is then normalisaed using the mean and standard deviation of the original training data calculated earlier. Values are then clipped to be within the interval [-3, 3].
 11. The model state correpsonding to the epoch that achieves the lowest validation mean squared error loss is evaluated on the test data. Both the error and predictions are plotted for the test data and compared with the true values.
+
+The inclusion of the transformer, written from scratch, is used to predict not just the target temperature for the current time interval, but forecast the next hour
+(12 intervals) using the sequence of the data of the previous hour for the multivariate input. This means that each dataset must now factor in, not just the length of the input
+sequence but also the length of the output sequence to forecast. This was tried because transformers are just inherently more powerful, but also provides a more realistic use
+case for the model in practice. 
+
+This change requires that the input and output sequences lengths must be used to correctly align the predictions an ground truths of the test data when plotting the forecast predictions.
+
+The plan will be to do the same with the original three models, and distill the project to a smaller number of scripts and lines of code.
